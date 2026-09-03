@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from github.GithubException import GithubException
+
 from ruciobot.checks.base import NO_BOT_LABEL, bot_marker, set_bot_login
 from ruciobot.checks.failing_tests import FAILING_TESTS_LABEL
 from ruciobot.checks.needs_rebase import NEEDS_REBASE_LABEL
@@ -29,6 +31,7 @@ from ruciobot.checks.stale_prs import (
     REVIEW_WAIT_DAYS,
     STALE_LABEL,
     WARN_DAYS,
+    StalePRCheck,
     process_pr,
 )
 
@@ -62,7 +65,9 @@ def _bot_comment(kind, created_at=NOW, login=BOT_LOGIN):
     comment.body = f"{bot_marker(kind)}\nsome text"
     comment.user = MagicMock()
     comment.user.login = login
+    comment.user.type = "Bot"
     comment.created_at = created_at
+    comment.updated_at = created_at
     return comment
 
 
@@ -77,8 +82,8 @@ class _PagedList(list):
         return len(self)
 
 
-def _user(login):
-    return SimpleNamespace(login=login)
+def _user(login, user_type="User"):
+    return SimpleNamespace(login=login, type=user_type)
 
 
 def _review(state, login, submitted_at):
@@ -89,8 +94,10 @@ def _commit(date):
     return SimpleNamespace(commit=SimpleNamespace(committer=SimpleNamespace(date=date)))
 
 
-def _comment(login, created_at):
-    return SimpleNamespace(user=_user(login), created_at=created_at)
+def _comment(login, created_at, updated_at=None):
+    return SimpleNamespace(
+        user=_user(login), created_at=created_at, updated_at=updated_at or created_at, body="Reply"
+    )
 
 
 def make_pr(
@@ -104,6 +111,7 @@ def make_pr(
     requested_teams=0,
     commits=None,
     comments=None,
+    review_comments=None,
     number=1,
 ):
     pr = MagicMock()
@@ -121,6 +129,7 @@ def make_pr(
     pr.get_review_requests.return_value = (users, teams)
     pr.get_commits.return_value = list(commits or [])
     pr.get_issue_comments.return_value = list(comments or [])
+    pr.get_review_comments.return_value = list(review_comments or [])
     return pr
 
 
@@ -158,6 +167,7 @@ class TestStalePRs(unittest.TestCase):
             labels=[STALE_LABEL],
             reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
             commits=[_commit(OLD_COMMIT)],
+            comments=[_bot_comment(KIND_WARNING, created_at=PAST_CLOSE)],
         )
         run_check(pr)
         pr.edit.assert_called_once_with(state="closed")
@@ -186,9 +196,167 @@ class TestStalePRs(unittest.TestCase):
             labels=[STALE_LABEL],
             reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
             commits=[_commit(OLD_COMMIT)],
+            comments=[_bot_comment(KIND_WARNING, business_days_before(CLOSE_DAYS - 1))],
         )
         run_check(pr)
         pr.edit.assert_not_called()
+
+    def test_8697_bot_label_changes_do_not_restart_stale_countdown(self):
+        """The 18 August label removal must not hide unanswered 29 July feedback."""
+        pr = make_pr(
+            number=8697,
+            created_at=datetime(2026, 7, 21, 14, 11, 7, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 18, 2, 31, 50, tzinfo=UTC),
+            reviews=[
+                _review("CHANGES_REQUESTED", "bari12", datetime(2026, 7, 29, 8, 58, 3, tzinfo=UTC))
+            ],
+            commits=[_commit(datetime(2026, 7, 21, 13, 18, 2, tzinfo=UTC))],
+        )
+        run_check(pr, now=datetime(2026, 9, 3, 5, 52, 22, tzinfo=UTC))
+        pr.add_to_labels.assert_called_once_with(STALE_LABEL)
+        pr.create_issue_comment.assert_called_once()
+        pr.edit.assert_not_called()
+
+    def test_bot_discussion_does_not_restart_stale_countdown(self):
+        """App accounts and the bot's own PAT login cannot keep a PR active."""
+        for login, user_type in [
+            (BOT_LOGIN, "Bot"),
+            ("other[bot]", "User"),
+            ("ci-app", "Bot"),
+            ("pat-bot", "User"),
+        ]:
+            with self.subTest(login=login):
+                set_bot_login("pat-bot" if login == "pat-bot" else BOT_LOGIN)
+                comment = _comment(login, RECENT)
+                comment.user.type = user_type
+                review = _review("APPROVED", login, RECENT)
+                review.user.type = user_type
+                pr = make_pr(
+                    created_at=OLD_COMMIT,
+                    updated_at=RECENT,
+                    reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW), review],
+                    commits=[_commit(OLD_COMMIT)],
+                    comments=[comment],
+                    review_comments=[comment],
+                )
+                run_check(pr)
+                pr.add_to_labels.assert_called_once_with(STALE_LABEL)
+                pr.edit.assert_not_called()
+
+    def test_human_discussion_delays_stale_warning(self):
+        """New comments, edits and inline feedback all reset human inactivity."""
+        for comment_type in ("issue", "edited", "inline"):
+            with self.subTest(comment_type=comment_type):
+                comment = (
+                    _comment("bob", OLD_REVIEW, RECENT)
+                    if comment_type == "edited"
+                    else _comment("bob", RECENT)
+                )
+                pr = make_pr(
+                    created_at=OLD_COMMIT,
+                    updated_at=RECENT,
+                    reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+                    commits=[_commit(OLD_COMMIT)],
+                    comments=[] if comment_type == "inline" else [comment],
+                    review_comments=[comment] if comment_type == "inline" else [],
+                )
+                run_check(pr)
+                pr.add_to_labels.assert_not_called()
+                pr.create_issue_comment.assert_not_called()
+                pr.edit.assert_not_called()
+
+    def test_author_inline_reply_clears_stale_label(self):
+        """An author's reply on a diff is a response, just like a top-level reply."""
+        pr = make_pr(
+            created_at=OLD_COMMIT,
+            updated_at=RECENT,
+            labels=[STALE_LABEL],
+            reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+            commits=[_commit(OLD_COMMIT)],
+            review_comments=[_comment("alice", RECENT)],
+        )
+        run_check(pr)
+        pr.remove_from_labels.assert_called_once_with(STALE_LABEL)
+        pr.add_to_labels.assert_called_once_with(NEEDS_REVIEW_LABEL)
+        pr.edit.assert_not_called()
+
+    def test_recent_warning_gets_full_grace_period(self):
+        """Old human inactivity must not cause immediate closure after a new warning."""
+        pr = make_pr(
+            created_at=OLD_COMMIT,
+            updated_at=NOW,
+            labels=[STALE_LABEL],
+            reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+            commits=[_commit(OLD_COMMIT)],
+            comments=[_bot_comment(KIND_WARNING, created_at=NOW)],
+        )
+        run_check(pr)
+        pr.edit.assert_not_called()
+        pr.create_issue_comment.assert_not_called()
+
+    def test_bot_housekeeping_does_not_delay_closure(self):
+        """Closure uses the warning date, even when bot activity updated the PR."""
+        warning = _bot_comment(KIND_WARNING, created_at=PAST_CLOSE)
+        pr = make_pr(
+            created_at=OLD_COMMIT,
+            updated_at=RECENT,
+            labels=[STALE_LABEL],
+            reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+            commits=[_commit(OLD_COMMIT)],
+            comments=[warning, _comment("other[bot]", RECENT)],
+        )
+        run_check(pr)
+        pr.edit.assert_called_once_with(state="closed")
+        warning.delete.assert_called_once()
+
+    def test_human_activity_extends_warning_grace_period(self):
+        """A maintainer's follow-up allows another CLOSE_DAYS before closure."""
+        pr = make_pr(
+            created_at=OLD_COMMIT,
+            updated_at=RECENT,
+            labels=[STALE_LABEL],
+            reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+            commits=[_commit(OLD_COMMIT)],
+            comments=[_bot_comment(KIND_WARNING, PAST_CLOSE), _comment("bob", RECENT)],
+        )
+        run_check(pr)
+        pr.edit.assert_not_called()
+        pr.create_issue_comment.assert_not_called()
+
+    def test_missing_warning_is_reissued_before_closing(self):
+        """A stale label alone cannot justify closing a PR."""
+        pr = make_pr(
+            created_at=OLD_COMMIT,
+            updated_at=PAST_STALE,
+            labels=[STALE_LABEL],
+            reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+            commits=[_commit(OLD_COMMIT)],
+        )
+        run_check(pr)
+        pr.create_issue_comment.assert_called_once()
+        self.assertIn(bot_marker(KIND_WARNING), pr.create_issue_comment.call_args.args[0])
+        pr.edit.assert_not_called()
+
+    def test_activity_fetch_failure_leaves_pr_unchanged(self):
+        """Incomplete activity data must not cause label changes or closure."""
+        for endpoint in ("get_reviews", "get_commits", "get_issue_comments", "get_review_comments"):
+            with self.subTest(endpoint=endpoint):
+                pr = make_pr(
+                    created_at=OLD_COMMIT,
+                    updated_at=PAST_STALE,
+                    labels=[STALE_LABEL, NEEDS_REVIEW_LABEL],
+                    reviews=[_review("CHANGES_REQUESTED", "bob", OLD_REVIEW)],
+                    commits=[_commit(OLD_COMMIT)],
+                    comments=[_bot_comment(KIND_WARNING, PAST_CLOSE)],
+                )
+                getattr(pr, endpoint).side_effect = GithubException(404, {"message": "Not Found"})
+                with patch("ruciobot.checks.stale_prs.datetime") as mock_dt:
+                    mock_dt.now.return_value = NOW
+                    self.assertTrue(StalePRCheck()._process_pr_safely(pr, MagicMock()))
+                pr.add_to_labels.assert_not_called()
+                pr.remove_from_labels.assert_not_called()
+                pr.create_issue_comment.assert_not_called()
+                pr.edit.assert_not_called()
 
     # Awaiting review: never closed for inactivity.
 

@@ -13,6 +13,11 @@ the last review or from the PR's creation. Author pushes and bot comments do
 not reset that clock, so an actively updated PR that nobody reviews is still
 surfaced.
 
+Staleness is measured from commits and human comments or reviews, never from
+GitHub's updated_at timestamp: bot comments and label changes must not reset
+the countdown. Closure has its own clock, starting with the stale warning
+or the latest human activity, whichever is later.
+
 PRs labeled ``failing-tests`` or ``needs-rebase`` are skipped: those checks
 run their own warn-and-close escalations and take precedence. Lingering
 ``stale`` or ``needs-review`` labels are cleared on the way out so they do
@@ -29,6 +34,7 @@ from .base import (
     count_business_days,
     delete_bot_comments,
     exclusion_reason,
+    get_bot_login,
     latest_bot_comment,
     post_bot_comment,
 )
@@ -47,7 +53,7 @@ CLOSE_DAYS = 7  # Weekdays after the stale warning before the PR is closed.
 
 # Weekdays without reviewer engagement before an awaiting-review PR is
 # surfaced with the needs-review label. Deliberately a separate clock from
-# the stale threshold: staleness measures author inactivity via updated_at,
+# the stale threshold: staleness measures commits and human discussion,
 # review starvation measures reviewer attention only.
 REVIEW_WAIT_DAYS = 14
 
@@ -99,9 +105,7 @@ def process_pr(pr: PullRequest, days_until_stale: int) -> None:
             return
 
     now = datetime.now(UTC)
-    assert pr.updated_at is not None, f"PR #{pr.number} has no updated_at timestamp"
     assert pr.created_at is not None, f"PR #{pr.number} has no created_at timestamp"
-    inactive_days = count_business_days(_to_utc(pr.updated_at), now)
     age_days = count_business_days(_to_utc(pr.created_at), now)
 
     labeled_stale = _has_label(pr, STALE_LABEL)
@@ -120,8 +124,11 @@ def process_pr(pr: PullRequest, days_until_stale: int) -> None:
     ):
         return
 
-    reviews = _safe_list(pr.get_reviews, "reviews")
-    court = _court_of_responsibility(pr, reviews)
+    # Failed activity lookups must reach BaseCheck's per-PR error handler.
+    # Treating missing data as no activity could incorrectly warn or close a PR.
+    reviews = [r for r in pr.get_reviews() if _is_human(r.user)]
+    last_activity, last_author = _activity_times(pr, reviews)
+    court = _court_of_responsibility(pr, reviews, last_author)
 
     if court != AUTHOR_BLOCKED:
         # Not the author's turn, so this PR is never closed for staleness.
@@ -137,17 +144,26 @@ def process_pr(pr: PullRequest, days_until_stale: int) -> None:
         return
 
     # The author owes a response.
+    inactive_days = count_business_days(last_activity, now)
     if labeled_needs_review:
         _clear_label(pr, NEEDS_REVIEW_LABEL, "is now waiting on the author")
 
     if labeled_stale:
-        if inactive_days >= CLOSE_DAYS:
-            _close_stale_pr(pr)
+        kind, warning = latest_bot_comment(pr)
+        if kind != KIND_WARNING or warning is None or warning.created_at is None:
+            # A label alone is not evidence that the author has been warned.
+            if inactive_days >= days_until_stale:
+                _mark_pr_stale(pr, days_until_stale)
+            return
+        warned_on = _to_utc(warning.created_at)
+        close_days = count_business_days(max(warned_on, last_activity), now)
+        if close_days >= CLOSE_DAYS:
+            _close_stale_pr(pr, warned_on)
     elif inactive_days >= days_until_stale:
         _mark_pr_stale(pr, days_until_stale)
 
 
-def _court_of_responsibility(pr: PullRequest, reviews: list) -> str:
+def _court_of_responsibility(pr: PullRequest, reviews: list, last_author: datetime | None) -> str:
     """Decide whether an open PR is waiting on the author, the maintainers, or a merge.
 
     - ``APPROVED``: an approving review exists, so it is waiting on a merge.
@@ -175,7 +191,6 @@ def _court_of_responsibility(pr: PullRequest, reviews: list) -> str:
     if last_review is None:
         return AWAITING_REVIEW  # never substantively reviewed
 
-    last_author = _last_author_activity(pr, author)
     if last_author is None or last_author >= last_review:
         return AWAITING_REVIEW  # the author acted most recently
 
@@ -202,17 +217,40 @@ def _review_starved_days(pr: PullRequest, reviews: list, now: datetime) -> int:
     return count_business_days(last, now)
 
 
-def _last_author_activity(pr: PullRequest, author: str | None) -> datetime | None:
-    """Most recent time the author pushed a commit or left a comment."""
-    times: list[datetime] = []
-    for commit in _safe_list(pr.get_commits, "commits"):
+def _activity_times(pr: PullRequest, reviews: list) -> tuple[datetime, datetime | None]:
+    """Return the latest relevant activity and the author's latest response.
+
+    Read each endpoint once, sharing the timestamps with responsibility
+    classification so replies on an inline review also count as responses.
+    Commits count as code activity regardless of who pushed them, matching
+    the existing responsibility check. Metadata changes do not count.
+    """
+    author = _login(pr.user)
+    times = [_to_utc(pr.created_at)]
+    author_times: list[datetime] = []
+    for commit in pr.get_commits():
         committer = commit.commit.committer if commit.commit else None
         if committer is not None and committer.date is not None:
-            times.append(_to_utc(committer.date))
-    for comment in _safe_list(pr.get_issue_comments, "comments"):
-        if _is_author(comment, author) and comment.created_at is not None:
-            times.append(_to_utc(comment.created_at))
-    return max(times, default=None)
+            date = _to_utc(committer.date)
+            times.append(date)
+            author_times.append(date)
+    for review in reviews:
+        if review.state != "PENDING" and review.submitted_at is not None:
+            date = _to_utc(review.submitted_at)
+            times.append(date)
+            if _is_author(review, author):
+                author_times.append(date)
+    for comments in (pr.get_issue_comments(), pr.get_review_comments()):
+        for comment in comments:
+            if not _is_human(comment.user):
+                continue
+            date = comment.updated_at or comment.created_at
+            if date is not None:
+                date = _to_utc(date)
+                times.append(date)
+                if _is_author(comment, author):
+                    author_times.append(date)
+    return max(times), max(author_times, default=None)
 
 
 def _flag_awaiting_review(pr: PullRequest, starved_days: int) -> None:
@@ -229,18 +267,17 @@ def _mark_pr_stale(pr: PullRequest, days: int) -> None:
     post_bot_comment(
         pr,
         KIND_WARNING,
-        f"This PR has had no activity for {days} weekdays and is waiting on its author. "
+        f"This PR has had no commits or human discussion for {days} weekdays "
+        "and is waiting on its author. "
         f"It has been marked as **stale** and will be closed in {CLOSE_DAYS} weekdays "
         "unless there is new activity.",
     )
     pr.add_to_labels(STALE_LABEL)
 
 
-def _close_stale_pr(pr: PullRequest) -> None:
+def _close_stale_pr(pr: PullRequest, warned_on: datetime) -> None:
     print(f"  [CLOSE] PR #{pr.number} has been stale for too long. Closing.")
-    kind, comment = latest_bot_comment(pr)
-    warned_on = comment.created_at if kind == KIND_WARNING and comment is not None else None
-    recap = f"A stale warning was issued on {warned_on:%Y-%m-%d}. " if warned_on else ""
+    recap = f"A stale warning was issued on {warned_on:%Y-%m-%d}. "
     post_bot_comment(
         pr,
         KIND_CLOSE,
@@ -292,13 +329,15 @@ def _is_author(obj, author: str | None) -> bool:
     return author is not None and _login(getattr(obj, "user", None)) == author
 
 
-def _safe_list(getter, label: str) -> list:
-    """Call a PyGithub list endpoint, returning [] on any error."""
-    try:
-        return list(getter())
-    except Exception as e:
-        print(f"  [WARN] Could not fetch {label}: {e}")
-        return []
+def _is_human(user) -> bool:
+    """Exclude GitHub App accounts and the bot's own login (including PAT use)."""
+    login = _login(user)
+    return (
+        login is not None
+        and login != get_bot_login()
+        and not login.endswith("[bot]")
+        and user.type != "Bot"
+    )
 
 
 def _to_utc(dt: datetime) -> datetime:
